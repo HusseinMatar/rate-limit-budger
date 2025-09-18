@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Rate-Limit Budget Challenge</title>
+<meta name="description" content="Mini-lab interattivo per capire budget GraphQL vs bucket REST su Shopify API.">
+<style>
+  :root { --bg:#0b1f17; --panel:#0f2d23; --accent:#62ffa4; --muted:#9ad3bf; --warn:#ffd166; }
+  body { margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Inter,Arial; background:radial-gradient(1000px 600px at 80% -20%, #134836 0%, #0b1f17 55%), #0b1f17; color:#e9fff6 }
+  .wrap { max-width:860px; margin:40px auto; padding:24px }
+  h1 { font-size:22px; margin:0 0 8px }
+  p.sub { margin:0 0 16px; color:var(--muted) }
+  .board { display:grid; grid-template-columns: 1.1fr 1fr; gap:16px }
+  .card { background:var(--panel); border-radius:16px; padding:16px; box-shadow:0 10px 30px rgba(0,0,0,.2) }
+  .meter { height:14px; background:#0b1f17; border-radius:999px; overflow:hidden; border:1px solid rgba(255,255,255,.08); margin-top:8px }
+  .bar { height:100%; width:50%; background:linear-gradient(90deg,var(--accent),#34d399); transition:width .25s }
+  .row { display:flex; gap:12px; flex-wrap:wrap; margin:12px 0 }
+  button { cursor:pointer; border:0; border-radius:12px; padding:10px 12px; color:#0b1f17; background:#e9fff6; font-weight:600; box-shadow:0 6px 18px rgba(0,0,0,.2); transition:transform .05s ease, box-shadow .2s ease; }
+  button:hover { transform:translateY(-1px) }
+  .ghost { background:#123c2f; color:#c9f5e6; border:1px solid rgba(255,255,255,.08) }
+  .warn { background:var(--warn); color:#231a06 }
+  .grid { display:grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap:10px }
+  .pill { display:inline-flex; align-items:center; gap:8px; background:#0b1f17; border:1px solid rgba(255,255,255,.08); padding:8px 10px; border-radius:999px; color:#cfeee3 }
+  .log { max-height:220px; overflow:auto; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; background:#0b1f17; border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:10px; }
+  .ok{color:#8ef7c2} .fail{color:#ffb4b4} .mut{color:#8fb9ac}
+  .footer{margin-top:10px; font-size:12px; color:#8fb9ac}
+  @media (max-width: 760px){ .board { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>Rate-Limit Budget Challenge</h1>
+    <p class="sub">Sei un’app Shopify: esegui le operazioni senza <strong>throttling</strong>. Il budget GraphQL si ricarica nel tempo. Pianifica bene!</p>
+    <div class="board">
+      <div class="card">
+        <h3 style="margin:0 0 8px">Budget <span id="budgetLabel"></span></h3>
+        <div class="meter"><div id="bar" class="bar"></div></div>
+        <div class="row">
+          <span class="pill">Max: <strong id="maxBudget">100</strong></span>
+          <span class="pill">Ricarica: <strong id="refill">20</strong> / 10s</span>
+        </div>
+        <div class="grid">
+          <button data-cost="10">Query: prodotti + varianti (10)</button>
+          <button data-cost="35">Query: prodotti + varianti + metafield (35)</button>
+          <button data-cost="50">Mutazione: aggiorna prezzi (50)</button>
+          <button data-cost="80" class="warn">Bulk kickoff (80)</button>
+        </div>
+        <div class="row">
+          <button id="toggleMode" class="ghost">Switch → REST</button>
+          <button id="reset" class="ghost">Reset</button>
+        </div>
+      </div>
+      <div class="card">
+        <h3 style="margin:0 0 8px">Console</h3>
+        <div class="log" id="log"></div>
+        <div class="footer">
+          Tip: GraphQL usa un <em>budget a crediti</em>; REST usa un <em>bucket di richieste</em>. Evita burst troppo grandi: usa code e backoff!
+        </div>
+      </div>
+    </div>
+  </div>
+<script>
+(() => {
+  const logEl = document.getElementById('log');
+  const bar = document.getElementById('bar');
+  const budgetLabel = document.getElementById('budgetLabel');
+  const maxBudgetEl = document.getElementById('maxBudget');
+  const refillEl = document.getElementById('refill');
+  const toggleBtn = document.getElementById('toggleMode');
+  const resetBtn = document.getElementById('reset');
+  const buttons = Array.from(document.querySelectorAll('button[data-cost]'));
+
+  let mode = 'GraphQL';            // 'GraphQL' | 'REST'
+  let maxBudget = 100;
+  let budget = 100;
+  let refill = 20;                  // credits per interval
+  let intervalMs = 10000;           // refill every 10s
+  let restBucket = 40;              // requests available in REST mode
+  let restMax = 40;
+  let restRefill = 10;              // refill per interval in REST
+
+  const fmt = (n) => Math.max(0, Math.round(n));
+  const log = (msg, cls='mut') => logEl.innerHTML = `<div class="${cls}">▸ ${msg}</div>` + logEl.innerHTML;
+  const draw = () => {
+    const value = (mode === 'GraphQL') ? budget : restBucket;
+    const max = (mode === 'GraphQL') ? maxBudget : restMax;
+    const pct = Math.max(0, Math.min(100, (value/max)*100));
+    bar.style.width = pct + '%';
+    budgetLabel.textContent = `— ${mode} budget: ${fmt(value)}/${max}`;
+    maxBudgetEl.textContent = max;
+    refillEl.textContent = (mode === 'GraphQL') ? `${refill} / ${intervalMs/1000}s` : `${restRefill} / ${intervalMs/1000}s`;
+  };
+
+  const tryConsume = (cost) => {
+    if (mode === 'GraphQL') {
+      if (budget - cost < 0) { log(`THROTTLING: costo ${cost} > budget ${fmt(budget)} — backoff richiesto`, 'fail'); return; }
+      budget -= cost; log(`Eseguito (GraphQL): costo ${cost}, budget residuo ${fmt(budget)}`, 'ok');
+    } else {
+      const requests = Math.ceil(cost/10); // map credits to requests for REST
+      if (restBucket - requests < 0) { log(`THROTTLING: richieste ${requests} > bucket ${fmt(restBucket)} — rallenta`, 'fail'); return; }
+      restBucket -= requests; log(`Eseguito (REST): richieste ${requests}, bucket residuo ${fmt(restBucket)}`, 'ok');
+    }
+    draw();
+  };
+
+  buttons.forEach(btn => btn.addEventListener('click', () => {
+    const base = Number(btn.dataset.cost);
+    tryConsume(base);
+  }));
+
+  toggleBtn.addEventListener('click', () => {
+    mode = (mode === 'GraphQL') ? 'REST' : 'GraphQL';
+    toggleBtn.textContent = (mode === 'GraphQL') ? 'Switch → REST' : 'Switch → GraphQL';
+    log(`Modalità cambiata: ${mode}`, 'mut');
+    draw();
+  });
+
+  resetBtn.addEventListener('click', () => {
+    budget = maxBudget; restBucket = restMax;
+    log('Reset budget/bucket', 'mut'); draw();
+  });
+
+  setInterval(() => {
+    if (mode === 'GraphQL') {
+      budget = Math.min(maxBudget, budget + refill);
+    } else {
+      restBucket = Math.min(restMax, restBucket + restRefill);
+    }
+    draw();
+  }, intervalMs);
+
+  draw(); log('Benvenuto! Prova a programmare le chiamate senza andare in throttling.', 'mut');
+})();
+</script>
+</body>
+</html>
